@@ -18,24 +18,12 @@
 #
 # 脚本会自动完成：
 #   - CPU 架构检测（amd64 / arm64）
+#   - 群晖 DSM / 飞牛 fnOS 识别，推荐 NAS 数据目录并优先 Docker
 #   - GitHub 加速源测速，拉取最新 release，失败时按顺序回退，直连始终兜底
 #   - SHA256 校验 release bundle
 #   - 直装版：安装 mise 与运行产物，注册 systemd 服务（无 systemd 时用 nohup）
 #   - Docker：拉取官方镜像，预拉取运行产物，创建并启动容器
 #   - ffmpeg：直装版通过系统包管理器安装；Docker 使用 :full 镜像
-#
-# 非交互用法（可选，任一项未设置时仍会弹出序号菜单）：
-#   AUTCLAW_INSTALL_MODE=direct|docker
-#   AUTCLAW_INSTALL_DIR=/opt/autclaw
-#   AUTCLAW_INSTALL_FFMPEG=1|0
-#   AUTCLAW_HTTP_PORT=8200
-#   AUTCLAW_GITHUB_PROXY=https://your-proxy.example/       # 额外优先尝试的加速源
-#   AUTCLAW_MISE_VERSION=2026.10.19                       # 默认与镜像内版本一致
-#   AUTCLAW_MISE_COMMAND=/usr/local/bin/mise              # 指定已有的 mise
-#   AUTCLAW_MISE_INSTALL_PATH=/usr/local/bin/mise         # 指定 mise 安装路径
-#   AUTCLAW_IMAGE=...                                     # 覆盖 Docker 镜像
-#   AUTCLAW_SKIP_PULL=1                                   # 使用本地已有镜像
-#   AUTCLAW_NONINTERACTIVE=1                              # 缺少必填项时直接报错
 #
 # 说明：
 #   - 直装版默认以 root 运行，与官方容器行为一致（插件需要执行外部命令/访问设备）。
@@ -75,10 +63,10 @@ MISE_VERSION="${AUTCLAW_MISE_VERSION:-${DEFAULT_MISE_VERSION}}"
 MISE_INSTALL_PATH="${AUTCLAW_MISE_INSTALL_PATH:-}"
 MISE_BIN=""
 GITHUB_PROXY="${AUTCLAW_GITHUB_PROXY:-}"
-INSTALL_MODE="${AUTCLAW_INSTALL_MODE:-}"
-INSTALL_DIR="${AUTCLAW_INSTALL_DIR:-}"
-INSTALL_FFMPEG="${AUTCLAW_INSTALL_FFMPEG:-}"
-HTTP_PORT="${AUTCLAW_HTTP_PORT:-}"
+INSTALL_MODE=""
+INSTALL_DIR=""
+INSTALL_FFMPEG=""
+HTTP_PORT=""
 IMAGE="${AUTCLAW_IMAGE:-}"
 WORK_DIR=""
 LOG_FILE=""
@@ -93,6 +81,9 @@ UNIT_PATH=""
 FFMPEG_OK=0
 FFMPEG_AMR=0
 MENU_INDEX=""
+NAS_KIND=""
+NAS_LABEL=""
+NAS_DEFAULT_DIR=""
 
 # ---------------------------------------------------------------------------
 # 输出
@@ -293,12 +284,6 @@ read_dir_value() {
   done
 }
 
-require_noninteractive() {
-  if [ "${AUTCLAW_NONINTERACTIVE:-0}" = "1" ]; then
-    die "$1"
-  fi
-}
-
 # ---------------------------------------------------------------------------
 # 平台与包管理器
 # ---------------------------------------------------------------------------
@@ -322,6 +307,58 @@ detect_platform() {
       ;;
   esac
   ok "系统架构: $(uname -m) -> linux-${ARCH}"
+}
+
+first_existing_dir() {
+  local pattern="$1" d
+  for d in ${pattern}; do
+    if [ -d "${d}" ]; then
+      printf '%s\n' "${d}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_nas() {
+  NAS_KIND=""
+  NAS_LABEL=""
+  NAS_DEFAULT_DIR=""
+
+  if [ -e /etc/synoinfo.conf ] || [ -e /etc.defaults/VERSION ]; then
+    NAS_KIND="synology"
+    NAS_LABEL="群晖 DSM"
+    local volume
+    if volume="$(first_existing_dir '/volume[0-9]*')"; then
+      NAS_DEFAULT_DIR="${volume}/docker/autclaw"
+    else
+      NAS_DEFAULT_DIR="/volume1/docker/autclaw"
+    fi
+  elif [ -e /etc/fnos-release ] || [ -e /etc/fnnas-release ] || [ -e /etc/feiniu-release ] \
+    || grep -qiE 'fnos|fnnas|feiniu' /etc/os-release 2>/dev/null; then
+    NAS_KIND="fnos"
+    NAS_LABEL="飞牛 fnOS"
+    local volume user_dir candidate
+    volume="$(first_existing_dir '/vol[0-9]*')" || volume="/vol1"
+    user_dir=""
+    for candidate in "${volume}"/[0-9]*; do
+      if [ -d "${candidate}/docker" ]; then
+        user_dir="${candidate}"
+        break
+      fi
+    done
+    if [ -z "${user_dir}" ] && [ -d "${volume}/1000" ]; then
+      user_dir="${volume}/1000"
+    fi
+    if [ -z "${user_dir}" ]; then
+      user_dir="$(first_existing_dir "${volume}/[0-9]*")" || user_dir="${volume}/1000"
+    fi
+    NAS_DEFAULT_DIR="${user_dir}/docker/autclaw"
+  fi
+
+  if [ -n "${NAS_KIND}" ]; then
+    ok "检测到 ${NAS_LABEL}，推荐数据目录: ${NAS_DEFAULT_DIR}"
+  fi
 }
 
 detect_systemd() {
@@ -1297,9 +1334,17 @@ run_direct_install() {
 # ---------------------------------------------------------------------------
 check_docker() {
   if ! command -v docker >/dev/null 2>&1; then
+    if [ "${NAS_KIND}" = "synology" ]; then
+      die "未检测到 docker。请先在群晖套件中心安装并启动 Container Manager（或 Docker）后重试。"
+    elif [ "${NAS_KIND}" = "fnos" ]; then
+      die "未检测到 docker。请先在飞牛应用中心安装并启动 Docker 后重试。"
+    fi
     die "未检测到 docker。请先安装 Docker：https://docs.docker.com/engine/install/"
   fi
   if ! docker info >/dev/null 2>&1; then
+    if [ -n "${NAS_KIND}" ]; then
+      die "Docker 守护进程不可用。请先在 ${NAS_LABEL} 上启动 Docker 服务后重试。"
+    fi
     die "Docker 守护进程不可用。请先启动 Docker（例如: systemctl start docker），并确认当前用户有权限。"
   fi
 }
@@ -1642,10 +1687,6 @@ ensure_root() {
     die "需要 root 权限，但未找到 sudo。请以 root 用户运行。"
   fi
 
-  if [ -n "${AUTCLAW_INSTALL_DIR:-}" ]; then
-    AUTCLAW_INSTALL_DIR="$(normalize_dir "${AUTCLAW_INSTALL_DIR}" || printf '%s' "${AUTCLAW_INSTALL_DIR}")"
-  fi
-
   local self
   if ! self="$(script_regular_path)"; then
     if ! command -v curl >/dev/null 2>&1; then
@@ -1661,11 +1702,10 @@ ensure_root() {
   local -a env_args=()
   local name
   for name in \
-    AUTCLAW_INSTALL_MODE AUTCLAW_INSTALL_DIR AUTCLAW_INSTALL_FFMPEG AUTCLAW_HTTP_PORT \
     AUTCLAW_GITHUB_PROXY AUTCLAW_RELEASE_REPO AUTCLAW_RELEASE_BASE \
     AUTCLAW_MISE_VERSION AUTCLAW_MISE_COMMAND AUTCLAW_MISE_INSTALL_PATH AUTCLAW_MISE_RELEASE_BASE \
     AUTCLAW_IMAGE AUTCLAW_IMAGE_SLIM AUTCLAW_IMAGE_FULL AUTCLAW_SKIP_PULL \
-    AUTCLAW_SYSTEMD_DIR AUTCLAW_FORCE_NO_SYSTEMD AUTCLAW_NONINTERACTIVE \
+    AUTCLAW_SYSTEMD_DIR AUTCLAW_FORCE_NO_SYSTEMD \
     AUTCLAW_CONTAINER_NAME AUTCLAW_SERVICE_NAME AUTCLAW_HEALTH_TIMEOUT \
     AUTCLAW_SCRIPT_URL AUTCLAW_SELF_TEMP \
     HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy \
@@ -1693,93 +1733,70 @@ main() {
 
   print_banner
   detect_platform
+  detect_nas
   detect_pkg_mgr || true
 
   # 安装方式
-  case "${INSTALL_MODE}" in
-    "")
-      ;;
-    1|direct|native)
-      INSTALL_MODE="direct"
-      ;;
-    2|docker)
-      INSTALL_MODE="docker"
-      ;;
-    *)
-      die "AUTCLAW_INSTALL_MODE 只能是 direct 或 docker"
-      ;;
-  esac
-  if [ -z "${INSTALL_MODE}" ]; then
-    require_noninteractive "非交互模式需要设置 AUTCLAW_INSTALL_MODE=direct|docker"
-    choose_menu "请选择安装方式" \
-      "直装版（二进制 + systemd，自动安装 mise）" \
+  local -a mode_options mode_values
+  if [ -n "${NAS_KIND}" ]; then
+    mode_options=(
+      "Docker（NAS 推荐，数据目录挂载到宿主机）"
+      "直装版（二进制 + systemd，自动安装 mise）"
+    )
+    mode_values=(docker direct)
+  else
+    mode_options=(
+      "直装版（二进制 + systemd，自动安装 mise）"
       "Docker（拉取官方镜像，数据目录挂载到宿主机）"
-    if [ "${MENU_INDEX}" -eq 1 ]; then
-      INSTALL_MODE="direct"
-    else
-      INSTALL_MODE="docker"
-    fi
+    )
+    mode_values=(direct docker)
+  fi
+  choose_menu "请选择安装方式" "${mode_options[@]}"
+  INSTALL_MODE="${mode_values[$((MENU_INDEX - 1))]}"
+  if [ -n "${NAS_KIND}" ] && [ "${INSTALL_MODE}" = "direct" ]; then
+    warn "在 ${NAS_LABEL} 上建议使用 Docker；直装版在无法使用 systemd 时重启后需要手动启动。"
   fi
 
   # 目录
-  if [ -z "${INSTALL_DIR}" ]; then
-    require_noninteractive "非交互模式需要设置 AUTCLAW_INSTALL_DIR"
-    local dir_title="请选择安装目录"
-    if [ "${INSTALL_MODE}" = "docker" ]; then
-      dir_title="请选择宿主机数据目录"
-    fi
-    choose_menu "${dir_title}" \
-      "${DEFAULT_INSTALL_DIR}（推荐）" \
-      "/usr/local/autclaw" \
-      "自定义路径"
-    case "${MENU_INDEX}" in
-      1) INSTALL_DIR="${DEFAULT_INSTALL_DIR}" ;;
-      2) INSTALL_DIR="/usr/local/autclaw" ;;
-      3) read_dir_value ;;
-    esac
+  local dir_title="请选择安装目录"
+  if [ "${INSTALL_MODE}" = "docker" ]; then
+    dir_title="请选择宿主机数据目录"
+  fi
+  local -a dir_options dir_values
+  if [ -n "${NAS_DEFAULT_DIR}" ]; then
+    dir_options=("${NAS_DEFAULT_DIR}（推荐）" "${DEFAULT_INSTALL_DIR}" "自定义路径")
+    dir_values=("${NAS_DEFAULT_DIR}" "${DEFAULT_INSTALL_DIR}" "")
   else
-    INSTALL_DIR="$(normalize_dir "${INSTALL_DIR}")" || die "安装目录无效"
+    dir_options=("${DEFAULT_INSTALL_DIR}（推荐）" "/usr/local/autclaw" "自定义路径")
+    dir_values=("${DEFAULT_INSTALL_DIR}" "/usr/local/autclaw" "")
+  fi
+  choose_menu "${dir_title}" "${dir_options[@]}"
+  if [ "${MENU_INDEX}" -eq "${#dir_options[@]}" ]; then
+    read_dir_value
+  else
+    INSTALL_DIR="${dir_values[$((MENU_INDEX - 1))]}"
   fi
   validate_install_dir "${INSTALL_DIR}" || die "安装目录无效: ${INSTALL_DIR}"
 
   # ffmpeg
-  case "${INSTALL_FFMPEG}" in
-    "")
-      ;;
-    1|true|yes|on|y)
-      INSTALL_FFMPEG="1"
-      ;;
-    0|false|no|off|n)
-      INSTALL_FFMPEG="0"
-      ;;
-    *)
-      die "AUTCLAW_INSTALL_FFMPEG 只能是 1 或 0"
-      ;;
-  esac
-  if [ -z "${INSTALL_FFMPEG}" ]; then
-    require_noninteractive "非交互模式需要设置 AUTCLAW_INSTALL_FFMPEG=1|0"
-    choose_menu "是否安装 ffmpeg（语音 / 视频转码）" \
-      "安装（推荐，Docker 使用 :full 镜像）" \
-      "不安装（飞书 / 微信 / 千寻音视频转码不可用）"
-    if [ "${MENU_INDEX}" -eq 1 ]; then
-      INSTALL_FFMPEG="1"
-    else
-      INSTALL_FFMPEG="0"
-    fi
+  choose_menu "是否安装 ffmpeg（语音 / 视频转码）" \
+    "安装（推荐，Docker 使用 :full 镜像）" \
+    "不安装（飞书 / 微信 / 千寻音视频转码不可用）"
+  if [ "${MENU_INDEX}" -eq 1 ]; then
+    INSTALL_FFMPEG="1"
+  else
+    INSTALL_FFMPEG="0"
   fi
   if [ "${INSTALL_FFMPEG}" = "0" ]; then
     log "不安装 ffmpeg：飞书 / 微信 / 千寻的音视频转码不可用，QQ / Telegram 不受影响"
   fi
 
   # 端口
-  if [ -z "${HTTP_PORT}" ]; then
-    require_noninteractive "非交互模式需要设置 AUTCLAW_HTTP_PORT"
-    choose_menu "请选择访问端口" "${DEFAULT_HTTP_PORT}（默认）" "自定义端口"
-    if [ "${MENU_INDEX}" -eq 2 ]; then
-      read_port_value
-    else
-      HTTP_PORT="${DEFAULT_HTTP_PORT}"
-    fi
+  choose_menu "请选择访问端口" "${DEFAULT_HTTP_PORT}（默认）" "自定义端口"
+  if [ "${MENU_INDEX}" -eq 2 ]; then
+    read_port_value
+  else
+    HTTP_PORT="${DEFAULT_HTTP_PORT}"
   fi
   valid_port "${HTTP_PORT}" || die "端口无效: ${HTTP_PORT}"
 

@@ -19,35 +19,21 @@ bash install.sh
 
 执行后只需要按序号选择：
 
-1. 安装方式：直装版 / Docker
-2. 安装（或宿主机数据）目录，默认 `/opt/autclaw`
+1. 安装方式：直装版 / Docker（群晖、飞牛默认推荐 Docker）
+2. 安装（或宿主机数据）目录，默认 `/opt/autclaw`；群晖、飞牛会自动推荐 NAS 目录
 3. 是否安装 ffmpeg
 4. 访问端口，默认 `8200`
 
 脚本会自动完成：
 
 - `amd64` / `arm64` 架构检测；
-- 并行测速内置的 GitHub 加速源，选最快源下载最新 release；失败时按顺序回退，直连始终兜底；
-- 下载 `autclaw-bundle-linux-<arch>.tar.gz`，并用同一 release 的 `SHA256SUMS` 校验；
-- 直装版：安装 `mise`、运行产物和可选的 ffmpeg，注册 `autclaw.service`（没有 systemd 时用 nohup 后台运行）；
-- Docker：拉取 `nolan1121953/autclaw:latest`，选择 ffmpeg 时改用 `nolan1121953/autclaw:full`，预拉取运行产物后创建并启动容器；
-- 等待 `/healthz` 就绪，输出访问地址、日志和停止命令。
+- 自动识别群晖 DSM、飞牛 fnOS，推荐对应的 NAS 数据目录并优先推荐 Docker；
+- 自动选择最快的下载源，下载并校验最新 release；
+- 直装版：安装 `mise`、运行产物和可选的 ffmpeg，注册 `autclaw` 服务；
+- Docker：拉取对应镜像，创建并启动容器；
+- 服务就绪后输出访问地址、日志和停止命令。
 
-直装版默认以 root 运行，与官方容器行为一致；数据、`dist/`、`plugin/`、`envs/` 都保存在所选目录，重跑脚本会保留用户插件和数据库。
-
-非交互场景可以用环境变量预设选项：
-
-```bash
-AUTCLAW_INSTALL_MODE=direct \
-AUTCLAW_INSTALL_DIR=/opt/autclaw \
-AUTCLAW_INSTALL_FFMPEG=1 \
-AUTCLAW_HTTP_PORT=8200 \
-bash <(curl -fsSL https://raw.githubusercontent.com/WGwuzhi/autClaw/main/install.sh)
-```
-
-设置 `AUTCLAW_NONINTERACTIVE=1` 后，缺少必填项会直接报错。`AUTCLAW_GITHUB_PROXY`、`AUTCLAW_MISE_VERSION`、`AUTCLAW_IMAGE`、`AUTCLAW_SKIP_PULL` 等高级选项见脚本头部注释。
-
-> 脚本安装的是 `WGwuzhi/autClaw` 发布的最新 release，不会在本机构建源码。Docker 模式按 rootful Docker 设计；使用 rootless Docker 时请改用直装版或手动部署。
+直装版默认以 root 运行；数据、`dist/`、`plugin/`、`envs/` 都保存在所选目录，重跑脚本会保留用户插件和数据库。
 
 ## 镜像版本
 
@@ -143,11 +129,11 @@ docker run -d --name autclaw --restart unless-stopped \
 ## 部署要求
 
 - Linux `amd64` / `arm64`
-- Docker 部署：已安装并启动 Docker（一键脚本按 rootful Docker 设计）
-- 一键脚本：需要 root 权限（脚本会自动通过 `sudo` 提权）；直装版会自动安装 `mise`，Docker 模式需要宿主机可访问 Docker Hub
+- Docker 部署：已安装并启动 Docker
+- 一键脚本：需要 root 权限（会自动通过 `sudo` 提权）；直装版会自动安装 `mise`，Docker 模式需要能访问 Docker Hub
 - 容器端口 `8200`
 - 持久化目录 `/opt/autclaw`（数据库、插件、运行时都在这里）
-- 宿主机可访问 GitHub（首次启动拉取 release bundle）与 Docker Hub
+- 宿主机可访问 GitHub 与 Docker Hub
 - 建议使用 bridge 网络 + 端口映射
 
 ## 部署
